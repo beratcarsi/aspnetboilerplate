@@ -1,16 +1,19 @@
 ﻿using System;
+using System.Configuration;
 using System.Globalization;
 using System.Linq;
-using System.Security.Claims;
 using System.Threading;
 using System.Web;
+using System.Web.Configuration;
 using Abp.Collections.Extensions;
+using Abp.Configuration;
 using Abp.Dependency;
+using Abp.Extensions;
 using Abp.Localization;
-using Abp.MultiTenancy;
-using Abp.Reflection;
-using Abp.Runtime.Security;
+using Abp.Modules;
+using Abp.Runtime.Session;
 using Abp.Threading;
+using Abp.Web.Configuration;
 
 namespace Abp.Web
 {
@@ -18,17 +21,15 @@ namespace Abp.Web
     /// This class is used to simplify starting of ABP system using <see cref="AbpBootstrapper"/> class..
     /// Inherit from this class in global.asax instead of <see cref="HttpApplication"/> to be able to start ABP system.
     /// </summary>
-    public abstract class AbpWebApplication : HttpApplication
+    /// <typeparam name="TStartupModule">Startup module of the application which depends on other used modules. Should be derived from <see cref="AbpModule"/>.</typeparam>
+    public abstract class AbpWebApplication<TStartupModule> : HttpApplication
+        where TStartupModule : AbpModule
     {
         /// <summary>
         /// Gets a reference to the <see cref="AbpBootstrapper"/> instance.
         /// </summary>
-        protected AbpBootstrapper AbpBootstrapper { get; private set; }
-
-        protected AbpWebApplication()
-        {
-            AbpBootstrapper = new AbpBootstrapper();
-        }
+        public static AbpBootstrapper AbpBootstrapper { get; } = AbpBootstrapper.Create<TStartupModule>();
+        private static IAbpWebLocalizationConfiguration _webLocalizationConfiguration;
 
         /// <summary>
         /// This method is called by ASP.NET system on web application's startup.
@@ -37,8 +38,9 @@ namespace Abp.Web
         {
             ThreadCultureSanitizer.Sanitize();
 
-            AbpBootstrapper.IocManager.RegisterIfNot<IAssemblyFinder, WebAssemblyFinder>();
             AbpBootstrapper.Initialize();
+
+            _webLocalizationConfiguration = AbpBootstrapper.IocManager.Resolve<IAbpWebLocalizationConfiguration>();
         }
 
         /// <summary>
@@ -70,22 +72,44 @@ namespace Abp.Web
         /// </summary>
         protected virtual void Application_BeginRequest(object sender, EventArgs e)
         {
-            var langCookie = Request.Cookies["Abp.Localization.CultureName"];
+            SetCurrentCulture();
+        }
+
+        protected virtual void SetCurrentCulture()
+        {
+            var globalizationSection = WebConfigurationManager.GetSection("globalization") as GlobalizationSection;
+            if (globalizationSection != null &&
+                !globalizationSection.UICulture.IsNullOrEmpty() &&
+                !string.Equals(globalizationSection.UICulture, "auto", StringComparison.InvariantCultureIgnoreCase))
+            {
+                return;
+            }
+
+            var langCookie = Request.Cookies[_webLocalizationConfiguration.CookieName];
             if (langCookie != null && GlobalizationHelper.IsValidCultureCode(langCookie.Value))
             {
                 Thread.CurrentThread.CurrentCulture = new CultureInfo(langCookie.Value);
                 Thread.CurrentThread.CurrentUICulture = new CultureInfo(langCookie.Value);
+                return;
             }
-            else if (!Request.UserLanguages.IsNullOrEmpty())
-            {
-                var firstValidLanguage = Request
-                    .UserLanguages
-                    .FirstOrDefault(GlobalizationHelper.IsValidCultureCode);
 
+            var defaultLanguage = AbpBootstrapper.IocManager.Using<ISettingManager, string>(settingManager => settingManager.GetSettingValue(LocalizationSettingNames.DefaultLanguage));
+            if (!defaultLanguage.IsNullOrEmpty() && GlobalizationHelper.IsValidCultureCode(defaultLanguage))
+            {
+                Thread.CurrentThread.CurrentCulture = new CultureInfo(defaultLanguage);
+                Thread.CurrentThread.CurrentUICulture = new CultureInfo(defaultLanguage);
+                Response.SetCookie(new HttpCookie(_webLocalizationConfiguration.CookieName, defaultLanguage));
+                return;
+            }
+
+            if (!Request.UserLanguages.IsNullOrEmpty())
+            {
+                var firstValidLanguage = Request?.UserLanguages?.FirstOrDefault(GlobalizationHelper.IsValidCultureCode);
                 if (firstValidLanguage != null)
                 {
                     Thread.CurrentThread.CurrentCulture = new CultureInfo(firstValidLanguage);
                     Thread.CurrentThread.CurrentUICulture = new CultureInfo(firstValidLanguage);
+                    Response.SetCookie(new HttpCookie(_webLocalizationConfiguration.CookieName, firstValidLanguage));
                 }
             }
         }
@@ -100,55 +124,12 @@ namespace Abp.Web
 
         protected virtual void Application_AuthenticateRequest(object sender, EventArgs e)
         {
-            TrySetTenantId();
+
         }
 
         protected virtual void Application_Error(object sender, EventArgs e)
         {
 
-        }
-
-        /// <summary>
-        /// Tries to set current tenant Id.
-        /// </summary>
-        protected virtual void TrySetTenantId()
-        {
-            var claimsPrincipal = User as ClaimsPrincipal;
-            if (claimsPrincipal == null)
-            {
-                return;
-            }
-
-            var claimsIdentity = claimsPrincipal.Identity as ClaimsIdentity;
-            if (claimsIdentity == null)
-            {
-                return;
-            }
-
-            var tenantIdClaim = claimsIdentity.Claims.FirstOrDefault(c => c.Type == AbpClaimTypes.TenantId);
-            if (tenantIdClaim != null)
-            {
-                return;
-            }
-
-            var tenantId = ResolveTenantIdOrNull();
-            if (!tenantId.HasValue)
-            {
-                return;
-            }
-
-            claimsIdentity.AddClaim(new Claim(AbpClaimTypes.TenantId, tenantId.Value.ToString(CultureInfo.InvariantCulture)));
-        }
-
-        /// <summary>
-        /// Resolves current tenant id or returns null if can not.
-        /// </summary>
-        protected virtual int? ResolveTenantIdOrNull()
-        {
-            using (var tenantIdResolver = AbpBootstrapper.IocManager.ResolveAsDisposable<ITenantIdResolver>())
-            {
-                return tenantIdResolver.Object.TenantId;
-            }
         }
     }
 }
